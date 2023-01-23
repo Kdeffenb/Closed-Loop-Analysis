@@ -1,0 +1,909 @@
+#installing and calling necesary libraries
+#some were added as we progressed
+
+library(beaker)
+library(dplyr)
+library(glue)
+install.packages('tidyr')
+library(tidyr)
+install.packages("tidyverse")
+library(tidyverse)
+library(palmerpenguins)
+install.packages('pwr')
+library(pwr)
+install.packages('stats')
+
+library(devtools)
+devtools::install_github(repo = "shipt/beaker",
+                         ref  = "master",
+                         subdir = "R/beaker",
+                         auth_token = Sys.getenv("GITHUB_PAT"))
+
+install_github(repo = "shipt/beaker",
+               ref  = "master",
+               subdir = "R/beaker",
+               auth_token = GITHUB_PAT(quiet = TRUE))
+
+
+# Question 1 ------
+#Percentage of customers who have placed another order since their survey date
+
+df_survey = read.csv('~/Downloads/ClosedLoopExperiment_July26.csv', header = TRUE)
+glimpse(df_survey)
+
+length(unique(df_survey$Customer.ID))
+#length is 1066, some customers appear multiple times.
+
+
+#formatting the date column from the .csv to combine with Snowflake
+df_survey$Survey.Response.Date <- as.Date(df_survey$Survey.Response.Date, format =  "%m/%d/%Y %H:%M")
+min(df_survey$Survey.Response.Date)
+
+df_check = df_survey %>% 
+  group_by(Customer.ID) %>% 
+  mutate(rank_Survey_time = row_number(Survey.Response.Date)) %>%
+  filter(rank_Survey_time > 1)
+glimpse(df_check)
+
+df_check_2 = df_survey %>%
+  filter(Customer.ID %in% df_check$Customer.ID)
+glimpse(df_check_2)
+
+#filtering out the 5 repeated customers (2 surveys each and experiment groups were not consistent)
+df_survey_clean = df_survey %>%
+  filter(!Customer.ID %in% df_check_2$Customer.ID)
+nrow(df_survey_clean)
+length(unique(df_survey_clean$Customer.ID))
+#Training note: instead of tablename$columnname can use df_survey_clean['Customer.ID']
+
+#Fetching order level data from Snowflake
+order_data_sql<- glue::glue("
+select CUSTOMER_ID, CREATED_AT, ID, ACTUAL_SUBTOTAL
+  from og_views.orders
+    where CREATED_AT BETWEEN '2022-5-1' AND '2022-9-1'")
+
+order_data <- query_shipt(drv = "ODBC",
+                              env = local_user_snowflake(),
+                              method = "fetch",
+                              sql = order_data_sql,
+                              retries = 1) %>% 
+  dplyr::rename_all(tolower) %>% 
+  tibble::as_tibble() 
+glimpse(order_data)
+
+#formatting snowflake timestamp into date
+order_data$created_at <- as.Date(order_data$created_at)
+
+df_survey_orders <- df_survey_clean %>% 
+  inner_join(order_data, by=c("Customer.ID"="customer_id")) %>%
+  filter(created_at > Survey.Response.Date)
+
+glimpse(df_survey_orders)
+
+num_orders <- df_survey_orders %>% 
+  group_by(Customer.ID) %>%
+  summarise(num_orders = n())
+glimpse(num_orders)
+
+#Question 1 answers -----
+reorder_survey <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID"))
+glimpse(reorder_survey)
+table(is.na(reorder_survey$num_orders))/nrow(reorder_survey)
+#Overall: 49.58% did not place another order, 50.42% did place another order
+
+reorder_survey_variant = reorder_survey %>%
+  filter(Experiement.Group == 'No Action Taken')
+
+table(is.na(reorder_survey_variant$num_orders))/nrow(reorder_survey_variant)
+#Variant Group (No action): 49.35% did not place another order, 50.65% did place another order
+
+reorder_survey_control = reorder_survey %>%
+  filter(Experiement.Group == 'Took Action')
+
+table(is.na(reorder_survey_control$num_orders))/nrow(reorder_survey_control)
+#Control Group (Action Taken): 49.89% did not place another order, 50.11% did place another order
+
+
+# Question 2 ------
+#what is the distribution of customer cohorts receiving this survey
+table(df_survey_clean$M...Engagement.Cohort)/nrow(df_survey_clean)
+#Casual = 516 or 48.63%, Core = 134 or 12.63%, Power = 116 or 10.93%, Dormant = 146 or 13.76%, Inactive = 148 or 13.95%
+
+table(reorder_survey_variant$M...Engagement.Cohort)/nrow(reorder_survey_variant)
+
+table(reorder_survey_control$M...Engagement.Cohort)/nrow(reorder_survey_control)
+
+#These were used to get the total number of each customer cohort in the experiment groups: See appendix
+reorder_survey_control %>%
+  filter(M...Engagement.Cohort == 'Active - Casual') %>%
+  select(Customer.ID) %>%
+  distinct() %>%
+  dim()
+
+
+reorder_survey_variant %>%
+  filter(M...Engagement.Cohort == 'Active - Core') %>%
+  select(Customer.ID) %>%
+  distinct() %>%
+  dim()
+#90 customers
+
+reorder_survey_control %>%
+  filter(M...Engagement.Cohort == 'Active - Core') %>%
+  select(Customer.ID) %>%
+  distinct() %>%
+  dim()
+#44 customers
+
+
+#Question 3 -----
+#What is the breakdown of reorder rate by customer cohort?
+
+#Variant
+
+reorder_survey_casual_variant <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'No Action Taken'& M...Engagement.Cohort == 'Active - Casual')
+
+table(is.na(reorder_survey_casual_variant$num_orders))/nrow(reorder_survey_casual_variant)
+
+reorder_survey_core_variant <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'No Action Taken'& M...Engagement.Cohort == 'Active - Core')
+
+table(is.na(reorder_survey_core_variant$num_orders))/nrow(reorder_survey_core_variant)
+
+reorder_survey_power_variant <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'No Action Taken'& M...Engagement.Cohort == 'Active - Power')
+
+table(is.na(reorder_survey_power_variant$num_orders))/nrow(reorder_survey_power_variant)
+
+reorder_survey_inactive_variant <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'No Action Taken'& M...Engagement.Cohort == 'Inactive')
+
+table(is.na(reorder_survey_inactive_variant$num_orders))/nrow(reorder_survey_inactive_variant)
+
+reorder_survey_dormant_variant <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'No Action Taken'& M...Engagement.Cohort == 'Dormant')
+
+table(is.na(reorder_survey_dormant_variant$num_orders))/nrow(reorder_survey_dormant_variant)
+
+#Control
+  
+reorder_survey_casual_control <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'Took Action'& M...Engagement.Cohort == 'Active - Casual')
+
+table(is.na(reorder_survey_casual_control$num_orders))/nrow(reorder_survey_casual_control)
+
+reorder_survey_core_control <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'Took Action'& M...Engagement.Cohort == 'Active - Core')
+
+table(is.na(reorder_survey_core_control$num_orders))/nrow(reorder_survey_core_control)
+
+reorder_survey_power_control <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'Took Action'& M...Engagement.Cohort == 'Active - Power')
+
+table(is.na(reorder_survey_power_control$num_orders))/nrow(reorder_survey_power_control)
+
+reorder_survey_inactive_control <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'Took Action'& M...Engagement.Cohort == 'Inactive')
+
+table(is.na(reorder_survey_inactive_control$num_orders))/nrow(reorder_survey_inactive_control)
+
+reorder_survey_dormant_control <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'Took Action'& M...Engagement.Cohort == 'Dormant')
+
+table(is.na(reorder_survey_dormant_control$num_orders))/nrow(reorder_survey_dormant_control)
+
+#Question 4 ----
+#What is the breakdown of reorder rate by membership type?
+
+#Variant
+
+reorder_survey_annual_variant <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'No Action Taken' & M...Plan.Type == c('Shipt Everyday', 'Annual'))
+
+table(is.na(reorder_survey_annual_variant$num_orders))/nrow(reorder_survey_annual_variant)
+
+reorder_survey_monthly_variant <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'No Action Taken' & M...Plan.Type == 'Monthly')
+
+table(is.na(reorder_survey_monthly_variant$num_orders))/nrow(reorder_survey_monthly_variant)
+
+reorder_survey_ppo_variant <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'No Action Taken' & M...Plan.Type == c('Single PPO', NA))
+
+table(is.na(reorder_survey_ppo_variant$num_orders))/nrow(reorder_survey_ppo_variant)
+
+#Control
+
+reorder_survey_annual_control <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'Took Action' & M...Plan.Type == c('Shipt Everyday', 'Annual'))
+
+table(is.na(reorder_survey_annual_control$num_orders))/nrow(reorder_survey_annual_control)
+
+reorder_survey_monthly_control <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'Took Action' & M...Plan.Type == 'Monthly')
+
+table(is.na(reorder_survey_monthly_control$num_orders))/nrow(reorder_survey_monthly_control)
+
+reorder_survey_ppo_control <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID")) %>%
+  filter(Experiement.Group == 'Took Action' & M...Plan.Type == c('Single PPO', NA))
+
+table(is.na(reorder_survey_ppo_control$num_orders))/nrow(reorder_survey_ppo_control)
+
+#Question 5 ----
+#How many orders did each user place before this negative survey?
+prev_order_data = query_shipt(drv = "ODBC", env = local_user_snowflake(), method = "fetch", sql = "
+select CUSTOMER_ID, CREATED_AT, ID, ACTUAL_SUBTOTAL
+  from og_views.orders")
+
+glimpse(prev_order_data)
+
+prev_order_data$CREATED_AT <- as.Date(prev_order_data$CREATED_AT)
+
+df_num_orders_prior <- df_survey_clean %>% 
+  inner_join(prev_order_data, by=c("Customer.ID"="CUSTOMER_ID")) %>%
+  filter(CREATED_AT <= Survey.Response.Date)
+
+glimpse(df_num_orders_prior)
+
+num_orders_prior <- df_num_orders_prior %>%
+  group_by(Customer.ID) %>%
+  summarise(num_orders = n())
+
+num_orders_prior_final <- df_survey_clean %>%
+  left_join(num_orders_prior, by=c("Customer.ID"))
+
+glimpse(num_orders_prior_final)
+
+save(num_orders_prior_final)
+write.csv(num_orders_prior_final, "num_orders_prior.csv")
+
+
+#Further Analysis-----
+#After previous results were reported to the team additional metric breakdowns were requested
+df_survey_ordersv2 <- df_survey_clean %>% 
+  mutate(order_window_end_date = Survey.Response.Date+30) %>%
+  inner_join(order_data, by=c("Customer.ID"="customer_id")) %>%
+  #filter(CREATED_AT > Survey.Response.Date)
+  filter(created_at > Survey.Response.Date, created_at <= order_window_end_date)
+
+glimpse(df_survey_ordersv2)
+summary(df_survey_ordersv2$ACTUAL_SUBTOTAL)
+table(is.na(df_survey_ordersv2$ACTUAL_SUBTOTAL))
+
+num_orders_30 <- df_survey_ordersv2 %>% 
+  group_by(Customer.ID) %>%
+  summarise(num_orders = n())
+glimpse(num_orders_30)
+
+#mutating data to add new customer cohort classifications for 30 days post survey response date: see appendix
+reorder_surveyv2 <- df_survey_clean %>%
+  left_join(num_orders_30, by=c("Customer.ID")) %>%
+  mutate(cohort_post_survey = case_when(num_orders %in% c(1,2) ~ 'Casual', num_orders %in% c(3,4) ~ 'Core', num_orders >= 5 ~ 'Power', is.na(num_orders) ~ 'Inactive'))
+glimpse(reorder_surveyv2)
+
+table(is.na(reorder_surveyv2$cohort_post_survey))/nrow(reorder_surveyv2)
+
+reorder_surveyv2$num_orders = reorder_surveyv2$num_orders %>% replace_na(0)
+glimpse(reorder_surveyv2)
+
+table(reorder_surveyv2$num_orders == 0)
+
+table(is.na(reorder_surveyv2$num_orders))
+
+#Question 6 ----
+#What is the order frequency for the customers? Does anyone change cohort?
+
+reorder_surveyv2 %>%
+  filter(Experiement.Group == 'No Action Taken') %>%
+  summarise(average_30_days = mean(num_orders))
+#Overall Variant: 1.47
+
+reorder_surveyv2 %>%
+  filter(Experiement.Group == 'Took Action') %>%
+  summarise(average_30_days = mean(num_orders))
+#Overall Control: 1.27
+
+reorder_surveyv2 %>%
+  filter(Experiement.Group == 'Took Action') %>%
+  summarise(sd_order_frequency = sd(num_orders, na.rm=TRUE))
+#sd = 2.36
+
+reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Power') %>%
+  summarise(average_30_days = mean(num_orders))
+#Power order frequency - 5.15
+
+reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Power' & Experiement.Group == "Took Action") %>%
+  summarise(average_30_days = mean(num_orders))
+#Power Control: 4.37
+
+reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Power' & Experiement.Group == "No Action Taken") %>%
+  summarise(average_30_days = mean(num_orders))
+#Power Variant: 5.66
+
+reorder_surveyv2_power <- reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Power')
+
+reorder_surveyv2_power %>%
+  summary(reorder_surveyv2_power$num_orders)
+
+hist(reorder_surveyv2_power$num_orders, breaks = 10)
+
+table(reorder_surveyv2_power$cohort_post_survey)/nrow(reorder_surveyv2_power)
+#54.31% remain power, 13.79% move to Casual, 24.14% move to Core, 7.76% move to Inactive
+
+reorder_surveyv2_power_variant = reorder_surveyv2_power %>%
+  filter(Experiement.Group == 'No Action Taken')
+  
+table(reorder_surveyv2_power_variant$cohort_post_survey)/nrow(reorder_surveyv2_power_variant)
+#Power Variant: 61.43% remain Power, 5.71% move to Casual, 25.71% move to Core, 7.14% move to Inactive
+
+reorder_surveyv2_power_control = reorder_surveyv2_power %>%
+  filter(Experiement.Group == 'Took Action')
+
+table(reorder_surveyv2_power_control$cohort_post_survey)/nrow(reorder_surveyv2_power_control)
+#Power Control: 43.48% remain Power, 26.09% move to Casual, 21.74% move to Core, 8.7% move to Inactive
+
+reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Core') %>%
+  summarise(average_30_days = mean(num_orders))
+#Core order frequency - 2.53
+
+reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Core' & Experiement.Group == "Took Action") %>%
+  summarise(average_30_days = mean(num_orders))
+#Core Control: 3.3
+
+reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Core' & Experiement.Group == "No Action Taken") %>%
+  summarise(average_30_days = mean(num_orders), 
+            sd_num_orders = sd(num_orders))
+#Core Variant: avg = 2.16 std = 1.87
+
+
+
+glimpse(reorder_surveyv2)
+
+reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Core' & Experiement.Group == "No Action Taken") %>%
+  summarise(average_30_days = mean(num_orders))
+
+
+reorder_surveyv2_core <- reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Core')
+
+hist(reorder_surveyv2_core$num_orders, breaks = 10)
+
+table(reorder_surveyv2_power$cohort_post_survey)/nrow(reorder_surveyv2_power)
+#Core Variant: 24.63% remain Core, 32.09% move to Casual, 17.16% move to Power, 26.12% move to Inactive
+
+reorder_surveyv2_core_variant = reorder_surveyv2_power %>%
+  filter(Experiement.Group == 'No Action Taken')
+
+table(reorder_surveyv2_power_variant$cohort_post_survey)/nrow(reorder_surveyv2_power_variant)
+#Core Control: 27.78% remain Core, 34.44% move to Casual, 13.33% move to Power, 24.44% move to Inactive
+
+reorder_surveyv2_core_control = reorder_surveyv2_power %>%
+  filter(Experiement.Group == 'Took Action')
+
+table(reorder_surveyv2_power_control$cohort_post_survey)/nrow(reorder_surveyv2_power_control)
+#12.18% remain Core, 27.27% move to Casual, 25% move to Power, 29.55% move to Inactive
+
+reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Casual') %>%
+  summarise(average_30_days = mean(num_orders))
+#Casual order frequency - .90
+
+reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Casual' & Experiement.Group == "Took Action") %>%
+  summarise(average_30_days = mean(num_orders))
+#Casual Control: 4.37
+
+reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Casual' & Experiement.Group == "No Action Taken") %>%
+  summarise(average_30_days = mean(num_orders))
+#Casual Variant: 5.66
+
+reorder_surveyv2_power <- reorder_surveyv2 %>%
+  filter(M...Engagement.Cohort == 'Active - Casual')
+
+hist(reorder_surveyv2_power$num_orders, breaks = 10)
+
+table(reorder_surveyv2_power$cohort_post_survey)/nrow(reorder_surveyv2_power)
+#27.52% remain Casual, 8.72% move to Core, 3.88% move to Power, 59.88% move to Inactive
+
+reorder_surveyv2_power_variant = reorder_surveyv2_power %>%
+  filter(Experiement.Group == 'No Action Taken')
+
+table(reorder_surveyv2_power_variant$cohort_post_survey)/nrow(reorder_surveyv2_power_variant)
+#Casual Variant: 27.43% remain Casual, 9.72% move to Core, 3.82% move to Power, 59.03% move to Inactive
+
+reorder_surveyv2_power_control = reorder_surveyv2_power %>%
+  filter(Experiement.Group == 'Took Action')
+
+table(reorder_surveyv2_power_control$cohort_post_survey)/nrow(reorder_surveyv2_power_control)
+#Casual Control: 27.63% remain Casual, 7.46% move to Core, 3.95% move to Power, 60.96% move to Inactive
+
+#Question 7 ----
+#What is the AOV for the customers? broken down by cohort as well.
+#for finding average AOV for a customer
+#Group By Customer.ID - summarise(mean)
+
+
+#df_survey_ordersv2$ACTUAL_SUBTOTAL = df_survey_ordersv2$ACTUAL_SUBTOTAL %>% replace_na(0)
+#df_survey_ordersv2$ACTUAL_SUBTOTAL <- as.numeric(df_survey_ordersv2$ACTUAL_SUBTOTAL)
+glimpse(df_survey_ordersv2)
+
+
+df_survey_ordersv2 %>%
+  summarise(sd_AOV = sd(actual_subtotal, na.rm=TRUE))
+#std = 58.75
+
+df_survey_ordersv2 %>%
+  filter(Experiement.Group == "Took Action") %>%
+  summarise(sd_AOV = sd(actual_subtotal, na.rm=TRUE))
+#Overall Control: std = 59.75
+
+df_survey_ordersv2 %>%
+  filter(Experiement.Group == "No Action Taken") %>%
+  summarise(sd_AOV = sd(ACTUAL_SUBTOTAL, na.rm=TRUE))
+#Overall Variant: std - 58.11
+
+df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'No Action Taken') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'Took Action') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Active - Power') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Active - Power' & Experiement.Group == 'No Action Taken') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Active - Power' & Experiement.Group == 'Took Action') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Active - Core') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Active - Core' & Experiement.Group == 'No Action Taken') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Active - Core' & Experiement.Group == 'Took Action') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Active - Casual') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Active - Casual' & Experiement.Group == 'No Action Taken') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Active - Casual' & Experiement.Group == 'Took Action') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Inactive' & Experiement.Group == 'No Action Taken') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+#Variant Inactive - 58.43
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Inactive' & Experiement.Group == 'Took Action') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+#Control Inactive - 56.89
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Dormant' & Experiement.Group == 'No Action Taken') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+#Variant Dormant - 89.10
+
+df_survey_ordersv2 %>% 
+  filter(M...Engagement.Cohort == 'Dormant' & Experiement.Group == 'Took Action') %>%
+  summarise(mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+#Control Dormant - 50.47
+
+#Question 8 ----
+#Performing a T-test for each of the above questions to determine stat sig.
+#Reorder rate within 30 days overall and by customer cohort
+#Order Frequency within 30 days overall and by customer cohort
+#AOV within 30 days overall and by customer cohort
+
+#Reorder rate Proportion test
+#Overall
+
+pwr.2p2n.test(n1 = 616, n2 = 445, sig.level = 0.05, power = .8,
+              alternative = c('less'))
+power.prop.test(n = 445, power = 0.8, p1 = .5011, sig.level = 0.05, alternative = c("one.sided"))
+
+
+power.prop.test(n = 445, p1 = .4578, p2 = .4022, sig.level = 0.05, alternative = c("one.sided"))
+#power is telling us the % chance we will see a stat sig p-value - 80% or more is best
+#(1268, 1268), larger sample size needed to determine if the reorder rate is stat sig
+
+reorder_surveyv2_variant = reorder_surveyv2 %>%
+  filter(Experiement.Group == "No Action Taken")
+table(reorder_surveyv2_variant$num_orders == 0)
+
+reorder_surveyv2_control = reorder_surveyv2 %>%
+  filter(Experiement.Group == "Took Action")
+table(reorder_surveyv2_control$num_orders == 0)
+
+prop.test(x = c(282,179), n = c(282+334, 179+266))
+#p-value = 0.08, not statistically significant, confidence interval = -0.007 & 0.118 sample estimates = .4578 & .4022
+
+prop.test(x = c(282,179), n = c(282+334, 179+266), alternative = c('less'))
+#less - pvalue = 0.96
+
+reorder_surveyv2_power_control = reorder_surveyv2 %>%
+  filter(Experiement.Group == "Took Action" & M...Engagement.Cohort == 'Active - Power')
+table(reorder_surveyv2_power_control$num_orders == 0)
+
+reorder_surveyv2_power_variant = reorder_surveyv2 %>%
+  filter(Experiement.Group == "No Action Taken", M...Engagement.Cohort == 'Active - Power')
+table(reorder_surveyv2_power_variant$num_orders == 0)
+
+prop.test(x = c(42,65), n = c(42+4, 65+5))
+#pvalue - 1 confidence interval - -0.132 & 0.101 sample estimates - 0.913 & 0.929
+
+prop.test(x = c(65,42), n = c(65+5, 42+4), alternative = c('less'))
+#Power reorder less - pvalue = 0.5
+
+
+reorder_surveyv2_core_control = reorder_surveyv2 %>%
+  filter(Experiement.Group == "Took Action" & M...Engagement.Cohort == 'Active - Core')
+table(reorder_surveyv2_core_control$num_orders == 0)
+
+reorder_surveyv2_core_variant = reorder_surveyv2 %>%
+  filter(Experiement.Group == "No Action Taken", M...Engagement.Cohort == 'Active - Core')
+table(reorder_surveyv2_core_variant$num_orders == 0)
+
+prop.test(x = c(31,68), n = c(31+13, 68+22))
+#pvalue - 0.673 confidence interval - -0.229 & 0.127 sample estimates - 0.705 & 0.756
+
+prop.test(x = c(68,31), n = c(68+22, 31+13), alternative = c('less'))
+#Core reorder less pvalue = 0.66
+
+
+reorder_surveyv2_casual_control = reorder_surveyv2 %>%
+  filter(Experiement.Group == "Took Action" & M...Engagement.Cohort == 'Active - Casual')
+table(reorder_surveyv2_casual_control$num_orders == 0)
+
+reorder_surveyv2_casual_variant = reorder_surveyv2 %>%
+  filter(Experiement.Group == "No Action Taken", M...Engagement.Cohort == 'Active - Casual')
+table(reorder_surveyv2_casual_variant$num_orders == 0)
+
+prop.test(x = c(89,118), n = c(89+139, 118+170))
+#pvalue - 0.722 confidence interval - -0.1083 & 0.0696 sample estimates - 0.3903 & 0.4097
+
+prop.test(x = c(118,89), n = c(118+170, 89+139), alternative = c('less'))
+#Casual reorder less pvalue = 0.64
+
+
+reorder_surveyv2_power_control = reorder_surveyv2 %>%
+  filter(Experiement.Group == "Took Action" & M...Engagement.Cohort == 'Inactive')
+table(reorder_surveyv2_power_control$num_orders == 0)
+
+reorder_surveyv2_power_variant = reorder_surveyv2 %>%
+  filter(Experiement.Group == "No Action Taken", M...Engagement.Cohort == 'Inactive')
+table(reorder_surveyv2_power_variant$num_orders == 0)
+
+prop.test(x = c(12,9), n = c(12+69, 9+58), alternative = c('less'))
+#Inactive reorder less pvalue = 0.50
+
+reorder_surveyv2_power_control = reorder_surveyv2 %>%
+  filter(Experiement.Group == "Took Action" & M...Engagement.Cohort == 'Dormant')
+table(reorder_surveyv2_power_control$num_orders == 0)
+
+reorder_surveyv2_power_variant = reorder_surveyv2 %>%
+  filter(Experiement.Group == "No Action Taken", M...Engagement.Cohort == 'Dormant')
+table(reorder_surveyv2_power_variant$num_orders == 0)
+
+prop.test(x = c(19,8), n = c(19+67, 8+52), alternative = c('greater'))
+#Dormant reorder less pvalue - 0.13
+
+#Order Frequency T-test
+
+pwr.t2n.test(n1= 616, n2= 445, power = .8, sig.level = 0.05,
+             alternative = c('less'))
+
+reorder_surveyv2 %>%
+  summarise(order_frequencysd = sd(num_orders, na.rm=TRUE))
+#sd = 2.43
+
+overall_control = reorder_surveyv2 %>%
+  filter(Experiement.Group == 'Took Action') %>%
+  select(num_orders)
+
+overall_variant = reorder_surveyv2 %>%
+  filter(Experiement.Group == 'No Action Taken') %>%
+  select(num_orders)
+
+t.test(overall_control, overall_variant)
+#only worked due to one column
+t.test(overall_control$num_orders, overall_variant$num_orders)
+#pvalue - 0.20 confidence interval = -0.492 & 0.105 mean of x(control) & y(variant) = 1.274 & 1.469
+
+
+t.test(overall_control$num_orders, overall_variant$num_orders, alternative = c('greater'))
+#Order Frequency Overall pvalue = 0.90
+
+reorder_power_control = reorder_surveyv2 %>%
+  filter(Experiement.Group == 'Took Action' & M...Engagement.Cohort == 'Active - Power') %>%
+  select(num_orders)
+
+reorder_power_variant = reorder_surveyv2 %>%
+  filter(Experiement.Group == 'No Action Taken' & M...Engagement.Cohort == 'Active - Power') %>%
+  select(num_orders)
+
+t.test(reorder_power_control, reorder_power_variant)
+#pvalue - 0.037 confidence interval = -2.497 & -0.0777 mean of x and y - 4.37 & 5.657 (1.287) #stat sig
+
+t.test(reorder_power_control, reorder_power_variant, alternative = c('greater'))
+#Order Frequency Power pvalue = 0.98
+
+reorder_core_control = reorder_surveyv2 %>%
+  filter(Experiement.Group == 'Took Action' & M...Engagement.Cohort == 'Active - Core') %>%
+  select(num_orders)
+
+reorder_core_variant = reorder_surveyv2 %>%
+  filter(Experiement.Group == 'No Action Taken' & M...Engagement.Cohort == 'Active - Core') %>%
+  select(num_orders)
+
+t.test(reorder_core_control, reorder_core_variant)
+#Order Frequency Core pvalue - 0.128 confidence interval - -0.34 & 2.619 mean of x and y - 3.295 & 2.156
+
+t.test(reorder_core_control, reorder_core_variant, alternative = c('greater'))
+#Order Frequency Core pvalue - 0.06
+
+reorder_casual_control = reorder_surveyv2 %>%
+  filter(Experiement.Group == 'Took Action' & M...Engagement.Cohort == 'Active - Casual') %>%
+  select(num_orders)
+
+reorder_casual_variant = reorder_surveyv2 %>%
+  filter(Experiement.Group == 'No Action Taken' & M...Engagement.Cohort == 'Active - Casual') %>%
+  select(num_orders)
+
+t.test(reorder_casual_control, reorder_casual_variant)
+#Order Frequency Casual pvalue - 0.512 confidence interval - -0.364 & 0.182 mean of x and y - 0.846 & 0.938
+
+t.test(reorder_casual_control, reorder_casual_variant, alternative = c('greater'))
+#Order Frequency Casual pvalue - 0.74
+
+#AOV T-test
+AOV_overall_control = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'Took Action') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(actual_subtotal, na.rm=TRUE))
+
+
+AOV_overall_variant = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'No Action Taken') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(actual_subtotal, na.rm=TRUE))
+
+
+t.test(AOV_overall_control$AOV, AOV_overall_variant$AOV)
+#Overall AOV pvalue - 0.43 confidence interval - -13.58 & 5.792 mean of x and y - 83.212 & 87.106
+
+t.test(AOV_overall_control$AOV, AOV_overall_variant$AOV, alternative = c('greater'))
+#Overall AOV pvalue - 0.79
+
+
+pwr.t2n.test(n1= 616, n2= 445, d = 3.57, sig.level = 0.05,
+             alternative = c('greater'))
+
+pwr.t2n.test(n1= 616, n2= 445, power = .8, sig.level = 0.05,
+             alternative = c('less'))
+
+#sample size - 20% = 168 10% = 673  15% = 299
+
+AOV_power_control = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'Took Action' & M...Engagement.Cohort == 'Active - Power') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+AOV_power_variant = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'No Action Taken' & M...Engagement.Cohort == 'Active - Power') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+t.test(AOV_power_control$AOV, AOV_power_variant$AOV)
+#Power AOV pvalue - 0.157 confidence interval - -31.498 & 5.177 mean of x and y - 79.429 & 92.59
+
+t.test(AOV_power_control$AOV, AOV_power_variant$AOV, alternative = c('greater'))
+#Power AOV pvalue - 0.92
+
+AOV_core_control = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'Took Action' & M...Engagement.Cohort == 'Active - Core') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+AOV_core_variant = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'No Action Taken' & M...Engagement.Cohort == 'Active - Core') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+t.test(AOV_core_control$AOV, AOV_core_variant$AOV)
+#Core AOV pvalue - 0.5 confidence interval - -12.528 & 25.362 mean of x and y - 93.564 & 87.147
+
+t.test(AOV_core_control$AOV, AOV_core_variant$AOV, alternative = c('greater'))
+#Core AOV pvalue - 0.25
+
+AOV_casual_control = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'Took Action' & M...Engagement.Cohort == 'Active - Casual') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+AOV_casual_variant = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'No Action Taken' & M...Engagement.Cohort == 'Active - Casual') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+t.test(AOV_casual_control$AOV, AOV_casual_variant$AOV)
+#Casual AOV pvalue - 0.877 confidence interval - -14.56 & 17.044 mean of x & y - 87.018 & 85.776
+
+t.test(AOV_casual_variant$AOV, AOV_casual_control$AOV, alternative = c('less'))
+#Casual AOV pvalue - 0.44
+
+AOV_inactive_control = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'Took Action' & M...Engagement.Cohort == 'Inactive') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+AOV_inactive_variant = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'No Action Taken' & M...Engagement.Cohort == 'Inactive') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+t.test(AOV_inactive_control$AOV, AOV_inactive_variant$AOV, alternative = c('greater'))
+#Inactive AOV pvalue - 0.39
+
+AOV_dormant_control = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'Took Action' & M...Engagement.Cohort == 'Dormant') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+AOV_dormant_variant = df_survey_ordersv2 %>% 
+  filter(Experiement.Group == 'No Action Taken' & M...Engagement.Cohort == 'Dormant') %>%
+  group_by(Customer.ID) %>%
+  summarise(AOV = mean(ACTUAL_SUBTOTAL, na.rm=TRUE))
+
+
+t.test(AOV_dormant_control$AOV, AOV_dormant_variant$AOV, alternative = c('greater'))
+#Dormant AOV pvalue - 0.02
+
+
+p.adjust(p = c(.96, .90, .79), method = "bonferroni", n = 6)
+#low sample, values coming up as 1, which is a high pvalue
+
+p.adjust(p = c(.50, .34, .36, .50, .13), method = "bonferroni", n = 6)
+
+p.adjust(p = c(.98, .06, .74), method = "bonferroni", n = 6)
+
+p.adjust(p = c(.94, .25, .44, .39, .99), method = "bonferroni", n = 6)
+
+
+
+#re-running reorder rate tests with 30 day limit
+
+df_survey_ordersv2 <- df_survey_clean %>% 
+  mutate(order_window_end_date = Survey.Response.Date+30) %>%
+  inner_join(order_data, by=c("Customer.ID"="CUSTOMER_ID")) %>%
+  filter(CREATED_AT > Survey.Response.Date, CREATED_AT <= order_window_end_date)
+
+df_survey_ordersv3 <- df_survey_clean %>%
+  mutate(order_window_end_date = Survey.Response.Date+30) %>%
+  inner_join(order_data, by=c("Customer.ID"="CUSTOMER_ID")) %>%
+  filter(CREATED_AT > Survey.Response.Date, CREATED_AT <= order_window_end_date)
+
+glimpse(df_survey_ordersv3)
+
+num_ordersv2 <- df_survey_ordersv3 %>% 
+  group_by(Customer.ID) %>%
+  summarise(num_orders = n())
+
+glimpse(num_ordersv2)
+
+reorder_surveyv3 <- df_survey_clean %>%
+  left_join(num_orders, by=c("Customer.ID"))
+
+glimpse(reorder_surveyv3)
+
+table(is.na(reorder_surveyv3$num_orders))/nrow(reorder_surveyv3)
+#Overall 56.55 did not place another order, 43.45 did place another order
+
+
+#Variant
+
+reorder_survey_variant = reorder_surveyv3 %>%
+  filter(Experiement.Group == 'No Action Taken')
+
+table(is.na(reorder_survey_variant$num_orders))/nrow(reorder_survey_variant)
+#Variant Group (No action): 54.22% did not place another order, 45.78% did place another order
+
+reorder_survey_control = reorder_surveyv3 %>%
+  filter(Experiement.Group == 'Took Action')
+
+table(is.na(reorder_survey_control$num_orders))/nrow(reorder_survey_control)
+#Control Group (Action Taken): 59.78% did not place another order, 40.22% did place another order
+
+
+reorder_survey_casual_variant2 <- reorder_surveyv3 %>%
+  filter(Experiement.Group == 'No Action Taken'& M...Engagement.Cohort == 'Active - Casual')
+
+table(is.na(reorder_survey_casual_variant2$num_orders))/nrow(reorder_survey_casual_variant2)
+#Casual Variant: 59.03% did not place another order, 40.97 did place another order
+
+reorder_survey_core_variant2 <- reorder_surveyv3 %>%
+  filter(Experiement.Group == 'No Action Taken'& M...Engagement.Cohort == 'Active - Core')
+
+table(is.na(reorder_survey_core_variant2$num_orders))/nrow(reorder_survey_core_variant2)
+#Core Variant: 24.44% did not place another order, 75.56% did place another order
+
+reorder_survey_power_variant2 <- reorder_surveyv3 %>%
+  filter(Experiement.Group == 'No Action Taken'& M...Engagement.Cohort == 'Active - Power')
+
+table(is.na(reorder_survey_power_variant2$num_orders))/nrow(reorder_survey_power_variant2)
+#Power Variant: 7.14% did not place another order, 92.86% did place another order
+
+#Control
+  
+reorder_survey_casual_control2 <- reorder_surveyv3 %>%
+  filter(Experiement.Group == 'Took Action'& M...Engagement.Cohort == 'Active - Casual')
+
+table(is.na(reorder_survey_casual_control2$num_orders))/nrow(reorder_survey_casual_control2)
+#Casual Control: 60.96% did not place another order, 39.04% did place another order
+
+reorder_survey_core_control2 <- reorder_surveyv3 %>%
+  filter(Experiement.Group == 'Took Action'& M...Engagement.Cohort == 'Active - Core')
+
+table(is.na(reorder_survey_core_control2$num_orders))/nrow(reorder_survey_core_control2)
+#Core Control: 29.55% did not place another order, 70.45% did place another order
+
+reorder_survey_power_control2 <- reorder_surveyv3 %>%
+  filter(Experiement.Group == 'Took Action'& M...Engagement.Cohort == 'Active - Power')
+
+table(is.na(reorder_survey_power_control2$num_orders))/nrow(reorder_survey_power_control2)
+#Power Control: 8.7% did not place another order, 91.3% did place another order
